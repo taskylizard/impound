@@ -163,6 +163,7 @@ interface PendingViolation {
   warnedMessages: Set<string> | undefined
 }
 
+/** Detect whether the current adapter exposes Rollup-compatible watch metadata. */
 function hasWatchMode(context: UnpluginBuildContext): context is UnpluginBuildContext & { meta: { watchMode?: unknown } } {
   return 'meta' in context && typeof context.meta === 'object' && context.meta !== null && 'watchMode' in context.meta
 }
@@ -727,12 +728,13 @@ export const ImpoundPlugin = createUnplugin<ImpoundOptions>((globalOptions) => {
     return (cachedEagerGraph ??= eagerGraph(moduleImports, resolvedImports, entries, cwd))
   }
 
-  // Trace and matcher state is build-scoped. Keep it for watch rebuilds, where the
-  // graph is needed for incremental diagnostics, but release it once a one-shot build
-  // has reported its deferred violations. In particular, source maps can retain large
-  // strings and buffers long after the transform that produced them.
-  function clearBuildState(): void {
-    if (watchMode)
+  /**
+   * Release trace and matcher state after one-shot builds and failed watch
+   * builds. Successful watch rebuilds retain the graph for incremental
+   * diagnostics; failures force cleanup because that graph is incomplete.
+   */
+  function clearBuildState(force = false): void {
+    if (watchMode && !force)
       return
 
     cachedEagerGraph = undefined
@@ -755,8 +757,7 @@ export const ImpoundPlugin = createUnplugin<ImpoundOptions>((globalOptions) => {
     buildStart() {
       watchMode = hasWatchMode(this) && this.meta.watchMode === true
     },
-    // Reports deferred violations, then releases build-scoped state. The finally
-    // path also runs when reporting or the build itself fails.
+    // Reports deferred violations, then releases build-scoped state.
     buildEnd,
     load: {
       filter: { id: PROXY_ID_RE },
@@ -1056,13 +1057,16 @@ export const ImpoundPlugin = createUnplugin<ImpoundOptions>((globalOptions) => {
     }
   }
 
+  /** Report deferred violations, then release state after one-shot builds or failures. */
   async function buildEnd(this: UnpluginBuildContext, buildError?: unknown): Promise<void> {
+    let completed = false
     try {
       if (traceEnabled)
         await reportHeldViolations.call(this, buildError)
+      completed = buildError === undefined
     }
     finally {
-      clearBuildState()
+      clearBuildState(!completed)
     }
   }
 
