@@ -163,6 +163,10 @@ interface PendingViolation {
   warnedMessages: Set<string> | undefined
 }
 
+function hasWatchMode(context: UnpluginBuildContext): context is UnpluginBuildContext & { meta: { watchMode?: unknown } } {
+  return 'meta' in context && typeof context.meta === 'object' && context.meta !== null && 'watchMode' in context.meta
+}
+
 /** Map imports to 1-indexed lines and 0-indexed UTF-16 columns. */
 function getImportLocations(code: string, imports: readonly { n: string | undefined, s: number, ss: number, se: number }[]): Map<string, ImportLocation> {
   const locations = new Map<string, ImportLocation>()
@@ -645,6 +649,7 @@ export const ImpoundPlugin = createUnplugin<ImpoundOptions>((globalOptions) => {
     : globalOptions.trace === true ? 'eager' : 'off'
   const traceEnabled = traceMode !== 'off'
   const maxTraceDepth = globalOptions.maxTraceDepth ?? 20
+  let watchMode = false
 
   const moduleImports = new Map<string, Map<string, ImportLocation>>()
   // Only modules a matcher includes can be the importer in a violation, so only those
@@ -722,11 +727,37 @@ export const ImpoundPlugin = createUnplugin<ImpoundOptions>((globalOptions) => {
     return (cachedEagerGraph ??= eagerGraph(moduleImports, resolvedImports, entries, cwd))
   }
 
+  // Trace and matcher state is build-scoped. Keep it for watch rebuilds, where the
+  // graph is needed for incremental diagnostics, but release it once a one-shot build
+  // has reported its deferred violations. In particular, source maps can retain large
+  // strings and buffers long after the transform that produced them.
+  function clearBuildState(): void {
+    if (watchMode)
+      return
+
+    cachedEagerGraph = undefined
+    moduleImports.clear()
+    moduleSources.clear()
+    resolvedImports.clear()
+    entries.clear()
+    pendingViolations.clear()
+    heldMessages.clear()
+    relativeImporterCache.clear()
+    for (const matcher of matcherStates) {
+      matcher.filterCache.clear()
+      matcher.warnedMessages?.clear()
+    }
+  }
+
   const plugins: UnpluginOptions[] = [{
     name: 'impound',
     enforce: 'pre' as const,
-    // Reports any violation still held once the build's graph is complete.
-    ...(traceEnabled ? { buildEnd: reportHeldViolations } : {}),
+    buildStart() {
+      watchMode = hasWatchMode(this) && this.meta.watchMode === true
+    },
+    // Reports deferred violations, then releases build-scoped state. The finally
+    // path also runs when reporting or the build itself fails.
+    buildEnd,
     load: {
       filter: { id: PROXY_ID_RE },
       handler(id: string) {
@@ -1022,6 +1053,16 @@ export const ImpoundPlugin = createUnplugin<ImpoundOptions>((globalOptions) => {
         // esbuild exposes no module graph, so there is no chain or snippet to add.
         reportViolation(violation, [{ file: violation.relativeImporter }], undefined, cwd, errorFn, violation.warnedMessages)
       }
+    }
+  }
+
+  async function buildEnd(this: UnpluginBuildContext, buildError?: unknown): Promise<void> {
+    try {
+      if (traceEnabled)
+        await reportHeldViolations.call(this, buildError)
+    }
+    finally {
+      clearBuildState()
     }
   }
 

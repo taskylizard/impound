@@ -1791,3 +1791,73 @@ describe('hook filters', () => {
     expect(excludeFilter.exclude.test('/app/entry.js')).toBe(false)
   })
 })
+
+describe('trace state lifecycle', () => {
+  it('releases trace and warning state after a non-watch build', async () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const plugins = ImpoundPlugin.rollup({
+      trace: true,
+      patterns: [['secret']],
+      error: false,
+    }) as any[]
+    const impoundPlugin = plugins.find(plugin => plugin.name === 'impound')!
+    const tracePlugin = plugins.find(plugin => plugin.name === 'impound:trace')!
+    const code = 'import secret from "secret"; export default secret'
+
+    await impoundPlugin.buildStart.call({ meta: { watchMode: false } })
+    await tracePlugin.transform.call({}, code, 'entry.js')
+    await impoundPlugin.resolveId.call({ error: () => {} }, 'secret', 'entry.js')
+    expect(errorSpy).toHaveBeenCalledTimes(1)
+
+    await impoundPlugin.buildEnd.call({})
+
+    // A second one-shot build gets a fresh warning set and can report again.
+    await tracePlugin.transform.call({}, code, 'entry.js')
+    await impoundPlugin.resolveId.call({ error: () => {} }, 'secret', 'entry.js')
+    expect(errorSpy).toHaveBeenCalledTimes(2)
+    errorSpy.mockRestore()
+  })
+
+  it('retains trace state across watch rebuilds', async () => {
+    const violations: ImpoundViolationInfo[] = []
+    const plugins = ImpoundPlugin.rollup({
+      trace: true,
+      patterns: [['secret']],
+      error: false,
+      onViolation: info => void violations.push(info),
+    }) as any[]
+    const impoundPlugin = plugins.find(plugin => plugin.name === 'impound')!
+    const tracePlugin = plugins.find(plugin => plugin.name === 'impound:trace')!
+    const code = 'import secret from "secret"; export default secret'
+
+    await impoundPlugin.buildStart.call({ meta: { watchMode: true } })
+    await tracePlugin.transform.call({}, code, 'entry.js')
+    await impoundPlugin.resolveId.call({ error: () => {} }, 'secret', 'entry.js')
+    await impoundPlugin.buildEnd.call({})
+
+    // The importer remains registered, so a watch rebuild reports immediately.
+    await impoundPlugin.resolveId.call({ error: () => {} }, 'secret', 'entry.js')
+    expect(violations).toHaveLength(2)
+  })
+
+  it('cleans state when deferred reporting receives a build error', async () => {
+    const violations: ImpoundViolationInfo[] = []
+    const plugins = ImpoundPlugin.rollup({
+      trace: true,
+      patterns: [['secret']],
+      error: false,
+      onViolation: info => void violations.push(info),
+    }) as any[]
+    const impoundPlugin = plugins.find(plugin => plugin.name === 'impound')!
+    const tracePlugin = plugins.find(plugin => plugin.name === 'impound:trace')!
+
+    await impoundPlugin.buildStart.call({ meta: { watchMode: false } })
+    await impoundPlugin.resolveId.call({ error: () => {} }, 'secret', 'entry.js')
+    await impoundPlugin.buildEnd.call({}, new Error('build failed'))
+
+    // The failed build's held violation must not leak into the next build.
+    await tracePlugin.transform.call({}, 'import secret from "secret"', 'entry.js')
+    await impoundPlugin.resolveId.call({ error: () => {} }, 'secret', 'entry.js')
+    expect(violations).toHaveLength(1)
+  })
+})
